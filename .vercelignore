@@ -1,0 +1,9 @@
+src/
+*.b64
+*.py
+app.src.html
+test_motor.js
+README.md
+foto.b64
+foto.txt
+config.json

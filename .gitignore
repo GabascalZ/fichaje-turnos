@@ -1,0 +1,23 @@
+# Config de Vercel
+.vercel
+
+# Temporal del guardia de sintaxis de build.py
+.chk.js
+
+# Personalización local: la foto de perfil por defecto y de quién es.
+# No va al repositorio; sin ella la app arranca sin foto.
+foto.b64
+foto.txt
+*.jpg
+*.jpeg
+*.png
+!icon-192.png
+!icon-512.png
+!apple-touch-icon.png
+
+# Generados por build.py
+index.html
+app.src.html
+
+# Sueldo base local (el del repositorio es un valor de ejemplo)
+config.json

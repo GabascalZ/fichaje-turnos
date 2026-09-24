@@ -1,0 +1,16 @@
+{
+  "name": "Fichaje de turnos",
+  "short_name": "Fichaje",
+  "description": "Horas y estimacion de nomina del aeropuerto",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#FAF3EC",
+  "theme_color": "#FAF3EC",
+  "orientation": "portrait",
+  "icons": [
+    { "src": "icon-192.png", "sizes": "192x192", "type": "image/png" },
+    { "src": "icon-512.png", "sizes": "512x512", "type": "image/png" },
+    { "src": "icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ]
+}

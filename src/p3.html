@@ -1,0 +1,1507 @@
+<script>
+(function(){
+"use strict";
+
+/* ═══════════════════════════════════════════════════════════
+   Valores por defecto — sacados de una hoja real de control horario
+   de turnos de aeropuerto (el bloque de mes más reciente).
+   ═══════════════════════════════════════════════════════════ */
+var DEF_RATES = {
+  noc:    1.61,   // € por hora trabajada entre 22:00 y 06:00
+  mad:    6.43,   // € por día que entra entre 04:00 y 06:55
+  fes:    2.85,   // € por hora, adicional, en día festivo
+  dom:    2.80,   // € por domingo trabajado
+  frac:  11.34,   // € por día de turno partido
+  transp: 2.83,   // € por día de asistencia
+  manut:  6.24,   // € por día de más de 6 h
+  tfd:   90.00,   // € fijo al mes
+  per:   22.00    // € por perentoria
+};
+var DEF_BASE = { base:__BASE__, umbral:151, valorCompl:10.25, impuestos:150, fesHoras:6, madNoc:1,
+                 impModo:"FIJO", impSS:6.47, impIRPF:2.5, festCV:1 };
+/* madNoc = 1 → un día con madrugue NO cobra además la nocturnidad de esas horas.
+   Es como está el Excel: los turnos de mañana que entran a las 04:00 o 05:00
+   cobran el madrugue (6,43 €) y no la nocturnidad de 04:00-06:00.              */
+
+var MESES = ["enero","febrero","marzo","abril","mayo","junio","julio","agosto","septiembre","octubre","noviembre","diciembre"];
+var DIAS  = ["domingo","lunes","martes","miércoles","jueves","viernes","sábado"];
+var TURNOS = [
+  {k:"MANANA", n:"Mañana",     ic:"🌅"},
+  {k:"TARDE",  n:"Tarde",      ic:"🌇"},
+  {k:"NOCHES", n:"Noches",     ic:"🌙"},
+  {k:"LIBRE",  n:"Libre",      ic:"🌿"},
+  {k:"VACAS",  n:"Vacaciones", ic:"🏖️"}
+];
+/* ═══════════ el cuadrante: ciclo de 3 semanas que siempre empieza en lunes ═══
+   Semana 1  L a D  ................. tardes
+   Semana 2  L M X libre · J a D .... mañanas
+   Semana 3  L M X mañanas · J a D .. libre
+   Son 21 días justos, así que cae siempre en el mismo día de la semana.     */
+var CICLO = [
+  "TARDE","TARDE","TARDE","TARDE","TARDE","TARDE","TARDE",
+  "LIBRE","LIBRE","LIBRE","MANANA","MANANA","MANANA","MANANA",
+  "MANANA","MANANA","MANANA","LIBRE","LIBRE","LIBRE","LIBRE"
+];
+var SEMANAS = [
+  {i:0,  t:"Tardes toda la semana"},
+  {i:7,  t:"Libro lunes, martes y miércoles · mañanas de jueves a domingo"},
+  {i:14, t:"Mañanas hasta el miércoles · libro de jueves a domingo"}
+];
+/* Horas por defecto de cada turno. Mañana y noche salen de su Excel; la de
+   tarde es una suposición y por eso el cuadrante las enseña para confirmarlas. */
+var PLANTILLA_DEF = {
+  MANANA: {i:"05:00", o:"13:00"},
+  TARDE:  {i:"16:00", o:"23:00"},   /* los 7 dias seguidos de junio que ella
+                                       apunto como "noches" son en realidad
+                                       este turno; que lo confirme */
+  NOCHES: {i:"22:00", o:"06:00"}
+};
+var KEY = "fichaje_turnos_v1";
+/* Foto de perfil por defecto y de quién es. Las pone build.py desde archivos
+   locales que no van al repositorio; sin ellos se queda la inicial del nombre.
+   Si se pone otra desde Ajustes, manda esa (vive en localStorage). */
+var FOTO_DEF = "__FOTO__";
+var FOTO_DE  = "__FOTO_DE__";
+
+/* ── estado ── */
+var DB, vista = "Hoy", mesActivo, diaAbierto = null;
+
+function clone(o){ return JSON.parse(JSON.stringify(o)); }
+function pad(n){ return (n<10?"0":"")+n; }
+/* __hoy le permite a test_motor / a mí fingir otra fecha para probar el cambio de mes.
+   Sin tocarla devuelve la de verdad. */
+function hoyDate(){ return window.__hoy ? new Date(window.__hoy) : new Date(); }
+function dkey(d){ return d.getFullYear()+"-"+pad(d.getMonth()+1)+"-"+pad(d.getDate()); }
+function mkey(d){ return d.getFullYear()+"-"+pad(d.getMonth()+1); }
+function parseDk(dk){ var p=dk.split("-"); return new Date(+p[0], +p[1]-1, +p[2]); }
+function prevMk(mk){ var y=+mk.slice(0,4), m=+mk.slice(5,7)-1; if(m<1){m=12;y--;} return y+"-"+pad(m); }
+function nextMk(mk){ var y=+mk.slice(0,4), m=+mk.slice(5,7)+1; if(m>12){m=1;y++;} return y+"-"+pad(m); }
+function nomMes(mk){ return MESES[+mk.slice(5,7)-1]+" "+mk.slice(0,4); }
+
+function eur(n){
+  if(!isFinite(n)) n=0;
+  return n.toFixed(2).replace(".",",")+" €";
+}
+function num(n, d){
+  d = d==null?2:d;
+  var s = (Math.round(n*100)/100).toFixed(d).replace(".",",");
+  return s.replace(/,?0+$/,"") || "0";
+}
+function horas(h){
+  if(!h) return "0 h";
+  var t = Math.round(h*60), H = Math.floor(t/60), M = t%60;
+  return M ? H+" h "+pad(M)+"m" : H+" h";
+}
+
+/* ═══════════════ persistencia ═══════════════ */
+/* Rellena lo que falte SIN volver a leer del movil. Se usa tanto al abrir como
+   al restaurar una copia: si aqui se releyera localStorage, restaurar no haria
+   nada y se perderia la copia. */
+function normaliza(){
+  if(!DB || typeof DB!=="object") DB = {};
+  if(DB.nombre == null) DB.nombre = "";
+  if(!DB.modo)   DB.modo = "VENCIDO";
+  if(!DB.meses)  DB.meses = {};
+  if(!DB.ajustes) DB.ajustes = {};
+  if(!DB.ajustes.rates) DB.ajustes.rates = clone(DEF_RATES);
+  if(!DB.ajustes.base)  DB.ajustes.base  = clone(DEF_BASE);
+  rellena(DB.ajustes.rates, DEF_RATES);
+  rellena(DB.ajustes.base,  DEF_BASE);
+  /* y tambien los meses ya guardados, que pueden ser de una version anterior
+     y no tener los ajustes nuevos */
+  Object.keys(DB.meses).forEach(function(k){
+    var c = DB.meses[k] && DB.meses[k].cfg;
+    if(!c) return;
+    if(!c.rates) c.rates = clone(DEF_RATES);
+    if(!c.base)  c.base  = clone(DEF_BASE);
+    rellena(c.rates, DEF_RATES);
+    rellena(c.base,  DEF_BASE);
+  });
+}
+function rellena(dest, def){
+  Object.keys(def).forEach(function(k){ if(dest[k] == null) dest[k] = def[k]; });
+}
+function cargar(){
+  var raw = null;
+  try { raw = localStorage.getItem(KEY); } catch(e){}
+  if(!raw) raw = rescataClaveVieja();
+  DB = null;
+  if(raw){ try { DB = JSON.parse(raw); } catch(e){ DB = null; } }
+  normaliza();
+}
+/* Si una versión anterior guardaba con otro nombre de clave, se recupera lo que
+   hubiera. Sin esto, renombrar la clave le borraría los meses ya apuntados. */
+function rescataClaveVieja(){
+  try{
+    for(var i=0;i<localStorage.length;i++){
+      var k = localStorage.key(i);
+      if(!k || k === KEY || k.indexOf("fichaje") !== 0) continue;
+      var v = localStorage.getItem(k);
+      if(v && v.indexOf('"meses"') >= 0){
+        localStorage.setItem(KEY, v);      /* se copia a la clave nueva */
+        return v;
+      }
+    }
+  }catch(e){}
+  return null;
+}
+var tGuardar = null, fallaGuardar = false;
+function guardar(){
+  if(tGuardar) clearTimeout(tGuardar);
+  tGuardar = setTimeout(function(){
+    try {
+      localStorage.setItem(KEY, JSON.stringify(DB));
+      if(fallaGuardar){ fallaGuardar = false; render(); }
+    } catch(e){
+      fallaGuardar = true;
+      toast("No se pudo guardar: haz una copia de seguridad ya");
+      render();
+    }
+  }, 120);
+}
+
+/* ═══════════════ meses y config ═══════════════ */
+function cfgDe(mk){
+  var M = DB.meses[mk];
+  if(M && M.cfg) return M.cfg;
+  /* hereda del mes con datos más reciente que sea anterior o igual */
+  var ks = Object.keys(DB.meses).filter(function(k){ return k<=mk && DB.meses[k].cfg; }).sort();
+  if(ks.length) return DB.meses[ks[ks.length-1]].cfg;
+  return { rates: DB.ajustes.rates, base: DB.ajustes.base };
+}
+function mesW(mk){                       /* para escribir: crea y congela cfg */
+  if(!DB.meses[mk]) DB.meses[mk] = { cfg: clone(cfgDe(mk)), dias:{} };
+  if(!DB.meses[mk].cfg)  DB.meses[mk].cfg  = clone(cfgDe(mk));
+  if(!DB.meses[mk].dias) DB.meses[mk].dias = {};
+  return DB.meses[mk];
+}
+function diaR(dk){ var M = DB.meses[dk.slice(0,7)]; return (M && M.dias && M.dias[dk]) || null; }
+/* diaW normal lo usa tambien el cuadrante; mio() marca que lo ha tocado ella,
+   para que el automatico no se lo pise nunca mas */
+function mio(dk){ var w = diaW(dk); delete w.auto; return w; }
+function diaW(dk){
+  var M = mesW(dk.slice(0,7));
+  if(!M.dias[dk]) M.dias[dk] = { t:[], turno:"", per:0, fes:null };
+  if(!M.dias[dk].t) M.dias[dk].t = [];
+  return M.dias[dk];
+}
+
+/* ═══════════════ festivos nacionales ═══════════════
+   Los 9 fijos de toda España mas el Viernes Santo, que se mueve. Jueves Santo
+   NO va: no es festivo en la Comunidad Valenciana ni en Cataluna. Los de la
+   comunidad y los del pueblo se marcan a mano tocando el dia.            */
+var FEST_FIJOS = ["01-01","01-06","05-01","08-15","10-12","11-01","12-06","12-08","12-25"];
+/* Comunitat Valenciana: San Jose, el 9 d'Octubre, y dos que se mueven con la
+   Pascua (Lunes de Pascua y Sant Vicent Ferrer). Aqui NO va el Jueves Santo:
+   en la Comunitat Valenciana no es festivo, se cambia por el Lunes de Pascua. */
+var FEST_CV_FIJOS = ["03-19","10-09"];
+var cacheFest = {};
+function pascua(y){                       /* Meeus/Jones/Butcher */
+  var a=y%19, b=Math.floor(y/100), c=y%100, d=Math.floor(b/4), e=b%4,
+      f=Math.floor((b+8)/25), g=Math.floor((b-f+1)/3), h=(19*a+b-d-g+15)%30,
+      i=Math.floor(c/4), k=c%4, l=(32+2*e+2*i-h-k)%7,
+      m=Math.floor((a+11*h+22*l)/451),
+      mes=Math.floor((h+l-7*m+114)/31), dia=((h+l-7*m+114)%31)+1;
+  return new Date(y, mes-1, dia);
+}
+function masDias(d, n){ var x = new Date(d); x.setDate(x.getDate()+n); return x; }
+function festivosDe(y, cv){
+  var clave = y + (cv ? "cv" : "");
+  if(cacheFest[clave]) return cacheFest[clave];
+  var s = {}, p = pascua(y);
+  FEST_FIJOS.forEach(function(f){ s[y+"-"+f] = 1; });
+  s[dkey(masDias(p,-2))] = 1;                       /* Viernes Santo */
+  if(cv){
+    FEST_CV_FIJOS.forEach(function(f){ s[y+"-"+f] = 1; });
+    s[dkey(masDias(p, 1))] = 1;                     /* Lunes de Pascua */
+    s[dkey(masDias(p, 8))] = 1;                     /* Sant Vicent Ferrer */
+  }
+  return (cacheFest[clave] = s);
+}
+function esFestivoNac(dk){
+  var cv = cfgDe(dk.slice(0,7)).base.festCV !== 0;
+  return !!festivosDe(+dk.slice(0,4), cv)[dk];
+}
+/* fes: null/undefined = lo que diga el calendario; true/false = lo dijo ella */
+function fesEfectivo(dk, d){
+  if(d && (d.fes===true || d.fes===false)) return d.fes;
+  return esFestivoNac(dk);
+}
+
+/* ═══════════════ cálculo ═══════════════ */
+function m2n(s){
+  if(!s || s.indexOf(":")<0) return null;
+  var p = s.split(":"), h = +p[0], m = +p[1];
+  if(isNaN(h)||isNaN(m)) return null;
+  return h*60+m;
+}
+function durMin(tr){
+  var a = m2n(tr.i), b = m2n(tr.o);
+  if(a==null || b==null) return 0;
+  var d = b-a; if(d<0) d += 1440;      /* cruza medianoche */
+  return d;
+}
+/* minutos del tramo que caen entre las 22:00 y las 06:00 */
+function nocMin(tr){
+  var a = m2n(tr.i); if(a==null) return 0;
+  var d = durMin(tr); if(d<=0) return 0;
+  var s = a, e = a+d, tot = 0;
+  for(var k=-1;k<=2;k++){
+    var ws = k*1440+1320, we = k*1440+1800;   /* 22:00 → 06:00 del día siguiente */
+    tot += Math.max(0, Math.min(e,we) - Math.max(s,ws));
+  }
+  return tot;
+}
+function calcDia(dk, d){
+  var r = {horas:0,noc:0,mad:0,manut:0,transp:0,dom:0,frac:0,per:0,fes:false,tramos:0,larga:0};
+  if(!d) return r;
+  var mins=0, nm=0, mad=false, n=0;
+  (d.t||[]).forEach(function(tr){
+    var du = durMin(tr); if(du<=0) return;
+    n++; mins += du; nm += nocMin(tr);
+    var a = m2n(tr.i);
+    if(a!=null && a>=240 && a<=415) mad = true;   /* entrada entre 04:00 y 06:55 */
+  });
+  r.tramos = n;
+  r.incompleto = (d.t||[]).some(function(tr){    /* puso una hora y se dejo la otra */
+    return (!!tr.i !== !!tr.o);
+  }) ? 1 : 0;
+  r.horas  = mins/60;
+  r.noc    = nm/60;
+  r.mad    = mad ? 1 : 0;
+  /* el madrugue y la nocturnidad se pisan en la franja 04:00-06:00: se cobra uno */
+  if(r.mad && cfgDe(dk.slice(0,7)).base.madNoc){ r.nocBruta = r.noc; r.noc = 0; }
+  r.manut  = r.horas > 6 ? 1 : 0;
+  r.transp = r.horas > 0 ? 1 : 0;
+  r.frac   = n >= 2 ? 1 : 0;
+  r.larga  = r.horas > 8 ? 1 : 0;
+  r.per    = +(d.per||0);
+  r.fes    = fesEfectivo(dk, d) && r.horas > 0;
+  r.dom    = (parseDk(dk).getDay()===0 && r.horas>0) ? 1 : 0;
+  return r;
+}
+function calcMes(mk){
+  var M = DB.meses[mk], dias = (M && M.dias) || {};
+  var t = {horas:0,noc:0,mad:0,manut:0,transp:0,dom:0,frac:0,per:0,fes:0,dias:0,vacio:true};
+  Object.keys(dias).forEach(function(dk){
+    if(dk.slice(0,7)!==mk) return;
+    var c = calcDia(dk, dias[dk]);
+    t.horas+=c.horas; t.noc+=c.noc; t.mad+=c.mad; t.manut+=c.manut;
+    t.transp+=c.transp; t.dom+=c.dom; t.frac+=c.frac; t.per+=c.per;
+    if(c.fes) t.fes++;
+    if(c.horas>0){ t.dias++; t.vacio=false; }
+  });
+  var B = cfgDe(mk).base;
+  t.compl = Math.max(0, t.horas - B.umbral);
+  return t;
+}
+/* Devuelve la estimación de pago del mes mk según el modo elegido. */
+function calcPago(mk){
+  var cfg = cfgDe(mk), R = cfg.rates, B = cfg.base;
+  var propio = calcMes(mk);
+  var srcMk  = DB.modo==="VENCIDO" ? prevMk(mk) : mk;
+  var src    = DB.modo==="VENCIDO" ? calcMes(srcMk) : propio;
+  var ad = {
+    noc:    src.noc    * R.noc,
+    mad:    src.mad    * R.mad,
+    fes:    src.fes    * R.fes * (B.fesHoras||6),
+    dom:    src.dom    * R.dom,
+    frac:   src.frac   * R.frac,
+    transp: src.transp * R.transp,
+    manut:  src.manut  * R.manut,
+    tfd:    R.tfd,
+    per:    src.per    * R.per
+  };
+  var totalAd = 0; Object.keys(ad).forEach(function(k){ totalAd += ad[k]; });
+  var complEur  = src.compl * B.valorCompl;
+  var totalBase = B.base + complEur;
+  var bruto     = totalBase + totalAd;
+  var porc      = B.impModo === "PORC";
+  var ss        = porc ? bruto * (B.impSS||0)/100   : 0;
+  var irpf      = porc ? bruto * (B.impIRPF||0)/100 : 0;
+  var imp       = porc ? ss + irpf : B.impuestos;
+  return {
+    cfg:cfg, R:R, B:B, propio:propio, src:src, srcMk:srcMk, ad:ad,
+    totalAd:totalAd, complEur:complEur, compl:src.compl,
+    totalBase:totalBase, bruto:bruto, porc:porc, ss:ss, irpf:irpf, impuestos:imp,
+    aCobrar: bruto - imp
+  };
+}
+
+/* ═══════════════ utilidades de UI ═══════════════ */
+function $(id){ return document.getElementById(id); }
+function el(tag, cls, txt){ var e=document.createElement(tag); if(cls)e.className=cls; if(txt!=null)e.textContent=txt; return e; }
+var tToast=null;
+function toast(msg){
+  var t = $("toast"); t.textContent = msg; t.classList.add("on");
+  if(tToast) clearTimeout(tToast);
+  tToast = setTimeout(function(){ t.classList.remove("on"); }, 2200);
+}
+function abrir(id){ $("ov").classList.add("on"); $(id).classList.add("on"); }
+function cerrar(id){ $("ov").classList.remove("on"); $(id).classList.remove("on"); diaAbierto=null; }
+function cerrarTodo(){ $("ov").classList.remove("on"); ["shDia","shInfo"].forEach(function(i){ $(i).classList.remove("on"); }); diaAbierto=null; }
+
+/* ═══════════════ cuadrante ═══════════════ */
+function lunesDe(d){ var x = new Date(d); x.setDate(x.getDate() - ((x.getDay()+6)%7)); return x; }
+function diasEntre(a, b){ return Math.round((a - b) / 86400000); }
+/* Qué turno toca ese día según el ciclo, o "" si no hay cuadrante puesto */
+function turnoCiclo(dk){
+  var C = DB.cuadrante;
+  if(!C || !C.ancla) return "";
+  var n = diasEntre(parseDk(dk), parseDk(C.ancla));
+  return CICLO[((n % 21) + 21) % 21];
+}
+/* Las horas que suele hacer en ese turno; si no hay nada apuntado, las de fábrica */
+function horasHabituales(turno){
+  var mejor = null;
+  Object.keys(DB.meses).sort().forEach(function(mk){
+    var ds = (DB.meses[mk] || {}).dias || {};
+    Object.keys(ds).sort().forEach(function(dk){
+      var d = ds[dk];
+      if(d && !d.auto && d.turno === turno && (d.t||[]).length === 1 && d.t[0].i && d.t[0].o) mejor = d.t[0];
+    });
+  });
+  return mejor ? {i:mejor.i, o:mejor.o} : clone(PLANTILLA_DEF[turno] || {i:"",o:""});
+}
+function plantilla(){
+  if(!DB.plantilla) DB.plantilla = {};
+  ["MANANA","TARDE","NOCHES"].forEach(function(k){
+    if(!DB.plantilla[k]) DB.plantilla[k] = horasHabituales(k);
+  });
+  return DB.plantilla;
+}
+/* Rellena los días vacíos (y los que ya puso el propio cuadrante) del rango.
+   Lo que ella haya apuntado a mano no se toca jamás. */
+function aplicaCuadrante(desde, hasta){
+  var C = DB.cuadrante;
+  if(!C || !C.ancla || !C.auto) return 0;
+  var P = plantilla(), n = 0, x = new Date(desde);
+  while(x <= hasta){
+    var dk = dkey(x), d = diaR(dk);
+    var libre = !d || (d.auto && !d.fes && !d.per);
+    if(libre && !(d && (d.t||[]).some(function(tr){ return tr.i || tr.o; }) && !d.auto)){
+      var turno = turnoCiclo(dk);
+      var h = P[turno];
+      var w = diaW(dk);
+      w.turno = turno;
+      w.t = h && h.i && h.o ? [{i:h.i, o:h.o}] : [];
+      w.auto = 1;
+      n++;
+    }
+    x.setDate(x.getDate()+1);
+  }
+  if(n) guardar();
+  return n;
+}
+/* Al abrir y al cambiar de mes: deja hechos el mes en curso y el siguiente */
+function cuadranteAlDia(){
+  if(!DB.cuadrante || !DB.cuadrante.auto) return;
+  var h = hoyDate();
+  var desde = lunesDe(new Date(h.getFullYear(), h.getMonth(), 1));
+  var hasta = new Date(h.getFullYear(), h.getMonth()+2, 0);
+  aplicaCuadrante(desde, hasta);
+}
+/* Si cambia las horas de un turno, los días que puso el cuadrante se rehacen
+   al momento. Si no, seguirían con las viejas hasta el siguiente arranque. */
+function reaplicaAuto(){
+  var P = plantilla(), n = 0;
+  Object.keys(DB.meses).forEach(function(mk){
+    var ds = DB.meses[mk].dias || {};
+    Object.keys(ds).forEach(function(dk){
+      var d = ds[dk];
+      if(!d.auto) return;
+      var h = P[d.turno];
+      d.t = (h && h.i && h.o) ? [{i:h.i, o:h.o}] : [];
+      n++;
+    });
+  });
+  if(n) guardar();
+  return n;
+}
+/* Borra lo que puso el cuadrante y deja lo suyo */
+function borraAuto(){
+  var n = 0;
+  Object.keys(DB.meses).forEach(function(mk){
+    var ds = DB.meses[mk].dias || {};
+    Object.keys(ds).forEach(function(dk){ if(ds[dk].auto){ delete ds[dk]; n++; } });
+  });
+  if(n) guardar();
+  return n;
+}
+
+/* ═══════════════ escribir la hora a mano ═══════════════
+   Ella lo pidió así: "lo que queremos es poder escribir el número". Traga 5,
+   05, 530, 0530, 5:30 y 17:16, y va poniendo los dos puntos sola.        */
+function soloDigitos(s){ return String(s||"").replace(/\D/g,"").slice(0,4); }
+/* lo que se ve mientras teclea: 5 · 17 · 17:1 · 17:16 · 5:3 · 5:30 */
+function vistaHora(d){
+  if(d.length <= 1) return d;
+  if(+d.slice(0,2) <= 23) return d.length <= 2 ? d : d.slice(0,2)+":"+d.slice(2,4);
+  return d.slice(0,1)+":"+d.slice(1,3);          /* "53" solo puede ser 5:3x */
+}
+/* al salir del campo se deja en HH:MM, o null si no hay manera */
+function hhmm(s){
+  var d = soloDigitos(s);
+  if(!d) return "";
+  var hs, ms;
+  if(d.length === 4){ hs = d.slice(0,2); ms = d.slice(2,4); }   /* 4 cifras son HHMM y punto */
+  else if(d.length <= 2 && +d <= 23){ hs = d; ms = "00"; }
+  else if(d.length === 3 && +d.slice(0,2) <= 23){ hs = d.slice(0,2); ms = d.slice(2); }
+  else { hs = d.slice(0,1); ms = d.slice(1,3); }                /* "530" solo puede ser 5:30 */
+  if(ms.length === 1) ms += "0";                 /* "17:1" se entiende 17:10 */
+  var h = +hs, m = +ms;
+  if(h > 23 || m > 59) return null;
+  return pad(h)+":"+pad(m);
+}
+function campoHora(dk, ids, i, cual, valor){
+  var inp = document.createElement("input");
+  inp.type = "text"; inp.inputMode = "numeric"; inp.maxLength = 5;
+  inp.placeholder = "--:--"; inp.value = valor || "";
+  inp.setAttribute("aria-label", cual === "i" ? "hora de entrada" : "hora de salida");
+  inp.onfocus = function(){ inp.select(); };
+  inp.oninput = function(){
+    var d = soloDigitos(inp.value);
+    inp.value = vistaHora(d);
+    var w = mio(dk), t = w.t[i] || (w.t[i] = {i:"",o:""});
+    var v = hhmm(d);
+    t[cual] = (v === null) ? "" : v;
+    if(cual === "i" && !w.turno && v){
+      var mm = m2n(v);
+      w.turno = (mm == null) ? "" : (mm < 720 ? "MANANA" : (mm < 1200 ? "TARDE" : "NOCHES"));
+    }
+    guardar();
+    refresca(dk, ids);          /* NO repinta los campos: perderia el teclado */
+  };
+  inp.onblur = function(){
+    var v = hhmm(inp.value);
+    if(v === null){ inp.value = ""; toast("Esa hora no existe"); }
+    else inp.value = v;
+    var w = mio(dk); (w.t[i] || (w.t[i] = {i:"",o:""}))[cual] = inp.value;
+    guardar(); pintaEditor(dk, ids); render();
+  };
+  return inp;
+}
+/* Actualiza solo lo que se deduce (duraciones, chips y el resumen de arriba)
+   sin tocar los campos donde está escribiendo. */
+function refresca(dk, ids){
+  var d = diaR(dk) || {t:[]};
+  var filas = $(ids.tramos).children;
+  for(var i=0;i<filas.length;i++){
+    var s = filas[i].querySelector(".dur");
+    if(s){ var du = durMin((d.t||[])[i] || {}); s.textContent = du ? horas(du/60) : "—"; }
+  }
+  pintaChips(dk, ids.chips);
+  if(vista === "Hoy") renderHoyResumen();
+  if(vista === "Mes") renderMes();
+}
+function pintaChips(dk, contId){
+  var d = diaR(dk) || {t:[],turno:""}, c = calcDia(dk, d);
+  var cC = $(contId); cC.innerHTML = "";
+  function chip(cls, txt){ cC.appendChild(el("span","chip "+cls, txt)); }
+  if(c.horas>0){
+    chip("", horas(c.horas));
+    if(c.noc>0)   chip("noc", "🌙 Nocturnidad "+horas(c.noc));
+    if(c.mad)     chip("mad", "🌅 Madrugue");
+    if(c.frac)    chip("par", "◑ Turno partido");
+    if(c.dom)     chip("dom", "☀ Domingo");
+    if(c.fes)     chip("fes", "★ Festivo");
+    if(c.manut)   chip("man", "🍽 Manutención");
+    if(c.larga)   chip("ext", "⚡ Jornada larga");
+    if(c.per>0)   chip("per", "⏱ Perentorias "+num(c.per));
+  } else {
+    chip("", d.turno==="LIBRE" ? "Día libre" : (d.turno==="VACAS" ? "Vacaciones" : "Sin horas todavía"));
+  }
+  if(c.incompleto) chip("ext", "⚠ Te falta una hora: así no cuenta");
+}
+
+/* ═══════════════ editor de un día (compartido) ═══════════════ */
+function pintaEditor(dk, ids){
+  var d = diaR(dk) || {t:[],turno:"",per:0,fes:false};
+  var c = calcDia(dk, d);
+
+  /* turnos */
+  var cT = $(ids.turnos); cT.innerHTML = "";
+  TURNOS.forEach(function(t){
+    var b = el("button","turno");
+    b.dataset.t = t.k;
+    b.dataset.on = (d.turno===t.k) ? "1" : "0";
+    b.innerHTML = '<span class="ic">'+t.ic+'</span>'+t.n;
+    b.onclick = function(){
+      var w = mio(dk);
+      w.turno = (w.turno===t.k) ? "" : t.k;
+      guardar(); pintaEditor(dk, ids); render();
+    };
+    cT.appendChild(b);
+  });
+
+  /* tramos: se escriben a mano. Nada de <input type="time">: la rueda de iOS
+     lanza un "change" en cada giro, y si aqui se repinta la fila el campo se
+     destruye y la rueda se cierra sola al levantar el dedo. */
+  var cTr = $(ids.tramos); cTr.innerHTML = "";
+  (d.t||[]).forEach(function(tr, i){
+    var row = el("div","tramo");
+    row.appendChild(el("span","t", i===0 ? "IN" : "+"));
+    var a = campoHora(dk, ids, i, "i", tr.i);
+    var b = campoHora(dk, ids, i, "o", tr.o);
+    row.appendChild(a);
+    row.appendChild(el("span","t","→"));
+    row.appendChild(b);
+    row.appendChild(el("span","dur", durMin(tr) ? horas(durMin(tr)/60) : "—"));
+    var x = el("button","del","✕");
+    x.onclick = function(){
+      var w = mio(dk); w.t.splice(i,1); guardar(); pintaEditor(dk, ids); render();
+    };
+    row.appendChild(x);
+    cTr.appendChild(row);
+  });
+  if(ids.add) $(ids.add).textContent = (d.t && d.t.length)
+    ? "+ Añadir tramo (turno partido)"
+    : "+ Poner las horas de este día";
+
+  /* perentorias */
+  var cP = $(ids.per); cP.innerHTML = "";
+  var menos = el("button",null,"−"), val = el("span","v", num(d.per||0)), mas = el("button",null,"+");
+  menos.onclick = function(){ var w=mio(dk); w.per = Math.max(0,(+w.per||0)-0.5); guardar(); pintaEditor(dk,ids); render(); };
+  mas.onclick   = function(){ var w=mio(dk); w.per = (+w.per||0)+0.5;             guardar(); pintaEditor(dk,ids); render(); };
+  cP.appendChild(menos); cP.appendChild(val); cP.appendChild(mas);
+
+  /* festivo: null = lo que diga el calendario nacional; true/false = lo dijo ella */
+  var cF = $(ids.fes), auto = esFestivoNac(dk), ef = fesEfectivo(dk, d);
+  cF.dataset.on = ef ? "1" : "0";
+  var kF = cF.parentNode.querySelector(".k");
+  if(kF) kF.innerHTML = "Festivo <small>" + (auto
+      ? (ef ? "festivo nacional, puesto solo" : "es festivo nacional, pero lo has quitado")
+      : (ef ? "lo has marcado tú" : "los del pueblo y la comunidad, a mano")) + "</small>";
+  cF.onclick = function(){
+    var w = mio(dk), nuevo = !fesEfectivo(dk, w);
+    w.fes = (nuevo === esFestivoNac(dk)) ? null : nuevo;   /* si coincide, vuelve a automatico */
+    guardar(); pintaEditor(dk, ids); render();
+  };
+
+  pintaChips(dk, ids.chips);
+  /* si es la hoja del dia, el bloque de repetir cambia de texto segun el turno */
+  if(ids === IDS_DIA && diaAbierto === dk) pintaRepe(dk);
+}
+var repeN = 6;
+function pintaRepe(dk){
+  var d = diaR(dk), hay = d && ((d.t||[]).length || d.turno);
+  $("repeCard").classList.toggle("hide", !hay);
+  if(!hay) return;
+  var c = $("repeStep"); c.innerHTML = "";
+  var menos = el("button",null,"−"), val = el("span","v",String(repeN)), mas = el("button",null,"+");
+  menos.onclick = function(){ repeN = Math.max(1, repeN-1); pintaRepe(dk); };
+  mas.onclick   = function(){ repeN = Math.min(31, repeN+1); pintaRepe(dk); };
+  c.appendChild(menos); c.appendChild(val); c.appendChild(mas);
+  var f = parseDk(dk), h = new Date(f); h.setDate(h.getDate()+repeN);
+  $("repeSub").textContent = "hasta el " + h.getDate() + " de " + MESES[h.getMonth()];
+  var esLibre = d.turno === "LIBRE" || d.turno === "VACAS";
+  $("repeAplica").textContent = (esLibre ? "Marcar también los " : "Repetir en los ")
+    + repeN + " días siguientes";
+  $("repeCard").querySelector(".lbl").textContent =
+    d.turno === "VACAS" ? "Marcar vacaciones seguidas"
+    : (d.turno === "LIBRE" ? "Marcar más días libres" : "Repetir este turno");
+}
+/* Copia turno y tramos a los N dias siguientes. Perentorias y festivo no se
+   copian: son de cada dia. */
+function repetir(dk){
+  var d = diaR(dk); if(!d) return;
+  var f = parseDk(dk), destinos = [], ocupados = [];
+  for(var i=1;i<=repeN;i++){
+    var x = new Date(f); x.setDate(x.getDate()+i);
+    var k = dkey(x), y = diaR(k);
+    destinos.push(k);
+    if(y && ((y.t||[]).length || y.turno)) ocupados.push(x.getDate());
+  }
+  if(ocupados.length && !confirm(
+      "Los días " + ocupados.join(", ") + " ya tienen turno puesto.\n\n¿Los sustituyo?")) return;
+  destinos.forEach(function(k){
+    var w = mio(k);
+    w.t = clone(d.t||[]); w.turno = d.turno || "";
+  });
+  guardar(); render();
+  toast("Turno repetido en " + destinos.length + " días");
+}
+function addTramo(dk, ids){
+  var w = mio(dk);
+  var last = w.t[w.t.length-1];
+  w.t.push({ i: last && last.o ? last.o : "", o:"" });
+  guardar(); pintaEditor(dk, ids); render();
+}
+
+/* ═══════════════ pantalla HOY ═══════════════ */
+var IDS_HOY = {turnos:"hoyTurnos",tramos:"hoyTramos",per:"hoyPer",fes:"hoyFes",chips:"hoyChips",add:"hoyAdd"};
+var IDS_DIA = {turnos:"dTurnos",  tramos:"dTramos",  per:"dPer",  fes:"dFes",  chips:"dChips",  add:"dAdd"};
+function renderHoy(){
+  renderHoyResumen();
+  pintaEditor(dkey(hoyDate()), IDS_HOY);
+}
+/* Solo la parte de arriba (saludo, dinero, semana). Se puede repintar mientras
+   ella escribe la hora sin quitarle el teclado de debajo. */
+function renderHoyResumen(){
+  var d = hoyDate(), mk = mkey(d);
+  var h = d.getHours();
+  $("saludo").textContent = h<13 ? "Buenos días" : (h<21 ? "Buenas tardes" : "Buenas noches");
+  $("nombre").textContent = DB.nombre;
+  $("hoyFecha").textContent = DIAS[d.getDay()]+"\n"+d.getDate()+" "+MESES[d.getMonth()];
+  $("hoyDia").textContent = DIAS[d.getDay()]+" "+d.getDate();
+
+  var P = calcPago(mk);
+  var mio = calcMes(mk);
+
+  if(DB.modo==="VENCIDO"){
+    $("moneyLbl").textContent = "Cobrarás en "+MESES[+mk.slice(5,7)-1];
+    $("moneyBig").textContent = eur(P.aCobrar);
+    $("moneySub").textContent = "base de "+MESES[+mk.slice(5,7)-1]+" + pluses de "+MESES[+P.srcMk.slice(5,7)-1];
+  } else {
+    $("moneyLbl").textContent = "Estimación de "+MESES[+mk.slice(5,7)-1];
+    $("moneyBig").textContent = eur(P.aCobrar);
+    $("moneySub").textContent = "todo del mes en curso";
+  }
+  $("mHoras").textContent = horas(mio.horas);
+  $("mHorasSub").textContent = mio.compl>0 ? ("+"+horas(mio.compl)+" complementarias") : ("de "+cfgDe(mk).base.umbral+" h");
+  $("mDias").textContent = mio.dias;
+
+  renderSemana(d);
+  renderCierre(mk);
+}
+/* Aviso de los primeros dias del mes: el contador esta a cero porque el mes
+   anterior se ha cerrado, no porque se haya perdido nada. */
+function renderCierre(mk){
+  var c = $("cierreCard"), ant = prevMk(mk), t = calcMes(ant);
+  var visible = hoyDate().getDate() <= 6 && !t.vacio && !(DB.visto||{})[mk];
+  c.classList.toggle("hide", !visible);
+  if(!visible) return;
+  $("cierreTxt").textContent = nomMes(ant).replace(/^./,function(x){return x.toUpperCase();})
+    + " cerró con " + horas(t.horas) + " y " + eur(calcPago(ant).aCobrar) + ".";
+  $("cierreVer").textContent = "Ver la nómina de " + MESES[+ant.slice(5,7)-1];
+  $("cierreVer").onclick = function(){ mesActivo = ant; vista = "Nom"; window.scrollTo(0,0); render(); };
+  $("cierreX").onclick = function(){ if(!DB.visto) DB.visto = {}; DB.visto[mk] = 1; guardar(); render(); };
+  $("cierreCopia").onclick = function(){ $("setExport").click(); };
+}
+function renderSemana(ref){
+  var d = new Date(ref), off = (d.getDay()+6)%7;   /* lunes = 0 */
+  d.setDate(d.getDate()-off);
+  var cont = $("semanaBody"); cont.innerHTML = "";
+  var maxH = 0, filas = [];
+  for(var i=0;i<7;i++){
+    var dk = dkey(d), c = calcDia(dk, diaR(dk));
+    filas.push({dk:dk, dia:DIAS[d.getDay()].slice(0,3), n:d.getDate(), c:c, hoy: dk===dkey(hoyDate())});
+    if(c.horas>maxH) maxH = c.horas;
+    d.setDate(d.getDate()+1);
+  }
+  var tot = filas.reduce(function(a,f){ return a+f.c.horas; },0);
+  filas.forEach(function(f){
+    var row = el("div","rowline");
+    if(f===filas[0]) row.style.borderTop="0";
+    var k = el("div","k");
+    k.innerHTML = '<span style="text-transform:capitalize">'+f.dia+' '+f.n+'</span>';
+    if(f.hoy) k.innerHTML += ' <span style="color:var(--nect-d);font-size:11px">· hoy</span>';
+    var bar = el("div"); bar.style.cssText="flex:1;height:8px;border-radius:99px;background:#F1EAE3;overflow:hidden;max-width:120px";
+    var fill = el("div");
+    var d2 = diaR(f.dk), col = (d2&&d2.turno==="NOCHES") ? "var(--lagune)" : (d2&&d2.turno==="VACAS" ? "var(--lila)" : "var(--peche)");
+    fill.style.cssText = "height:100%;border-radius:99px;background:"+col+";width:"+(maxH?Math.round(f.c.horas/maxH*100):0)+"%";
+    bar.appendChild(fill);
+    var v = el("div",null, f.c.horas ? horas(f.c.horas) : "—");
+    v.style.cssText = "font-weight:700;font-size:13px;width:62px;text-align:right;color:"+(f.c.horas?"var(--ink)":"var(--muted)");
+    row.appendChild(k); row.appendChild(bar); row.appendChild(v);
+    cont.appendChild(row);
+  });
+  var t = el("div","rowline"); t.style.cssText="border-top:2px solid var(--ink);margin-top:4px";
+  t.appendChild(el("div","k","Total semana"));
+  var tv = el("div",null,horas(tot)); tv.style.cssText="font-weight:700";
+  t.appendChild(tv); cont.appendChild(t);
+}
+
+/* ═══════════════ pantalla MES ═══════════════ */
+function renderMes(){
+  var y = +mesActivo.slice(0,4), m = +mesActivo.slice(5,7)-1;
+  $("mTitulo").textContent = nomMes(mesActivo);
+  var g = $("mGrid"); g.innerHTML = "";
+  var first = new Date(y,m,1), off = (first.getDay()+6)%7, ndias = new Date(y,m+1,0).getDate();
+  for(var i=0;i<off;i++) g.appendChild(el("div","day void"));
+  var hoyK = dkey(hoyDate());
+  for(var n=1;n<=ndias;n++){
+    var dk = y+"-"+pad(m+1)+"-"+pad(n);
+    var d = diaR(dk), c = calcDia(dk, d);
+    var cell = el("button","day");
+    if(d && d.turno) cell.dataset.t = d.turno;
+    if(d && d.auto) cell.classList.add("auto");
+    if(dk===hoyK) cell.classList.add("today");
+    if(c.dom || c.fes) cell.classList.add("mark");
+    cell.appendChild(el("span",null,String(n)));
+    if(c.horas>0) cell.appendChild(el("span","h", num(c.horas,1)+"h"));
+    var dots = el("div","dots");
+    function dot(col){ var i2=el("i"); i2.style.background=col; dots.appendChild(i2); }
+    if(c.noc>0) dot("var(--lagune-d)");
+    if(c.mad)   dot("var(--peche-d)");
+    if(c.frac)  dot("var(--nect-d)");
+    if(c.per>0) dot("#6B5A86");
+    if(dots.children.length) cell.appendChild(dots);
+    (function(k){ cell.onclick = function(){ abrirDia(k); }; })(dk);
+    g.appendChild(cell);
+  }
+  /* semanas */
+  var cs = $("mSemanas"); cs.innerHTML = "";
+  var cur = new Date(y,m,1); cur.setDate(cur.getDate() - ((cur.getDay()+6)%7));
+  var wi = 1, fin = new Date(y,m+1,0);
+  while(cur <= fin){
+    var tot=0, ini=new Date(cur), any=false;
+    for(var k2=0;k2<7;k2++){
+      var dd = new Date(cur); dd.setDate(dd.getDate()+k2);
+      if(dd.getMonth()===m){ any=true; tot += calcDia(dkey(dd), diaR(dkey(dd))).horas; }
+    }
+    if(any){
+      var r = el("div","rowline"); if(wi===1) r.style.borderTop="0";
+      var kk = el("div","k"); kk.innerHTML = "Semana "+wi+' <small>'+ini.getDate()+" "+MESES[ini.getMonth()].slice(0,3)+"</small>";
+      var vv = el("div",null,horas(tot)); vv.style.cssText="font-weight:700;font-size:14px";
+      r.appendChild(kk); r.appendChild(vv); cs.appendChild(r); wi++;
+    }
+    cur.setDate(cur.getDate()+7);
+  }
+  renderCubierto();
+  /* recuento (los "RANGOS" del Excel) */
+  var t = calcMes(mesActivo), B = cfgDe(mesActivo).base;
+  var cr = $("mRangos"); cr.innerHTML = "";
+  [ ["Días trabajados", t.dias, ""],
+    ["Horas totales", horas(t.horas), ""],
+    ["Horas complementarias", horas(t.compl), "por encima de "+B.umbral+" h"],
+    ["Nocturnidad", horas(t.noc), "entre 22:00 y 06:00"],
+    ["Madrugue", t.mad, "entrada de 04:00 a 06:55"],
+    ["Festivos", t.fes, ""],
+    ["Domingos", t.dom, ""],
+    ["Turnos partidos", t.frac, ""],
+    ["Manutención", t.manut, "días de más de 6 h"],
+    ["Perentorias", num(t.per), ""]
+  ].forEach(function(r,i){
+    var row = el("div","nrow"+(i===0?" first":"")+((r[1]===0||r[1]==="0 h")?" z":""));
+    var k = el("div","k", r[0]);
+    if(r[2]) k.innerHTML = r[0]+' <small style="display:block;font-size:11px;color:var(--muted);font-weight:500">'+r[2]+'</small>';
+    row.appendChild(k);
+    row.appendChild(el("div","v", String(r[1])));
+    cr.appendChild(row);
+  });
+}
+function abrirDia(dk){
+  diaAbierto = dk;
+  var d = parseDk(dk);
+  $("dTitulo").textContent = DIAS[d.getDay()]+", "+d.getDate()+" de "+MESES[d.getMonth()];
+  $("dSub").textContent = nomMes(dk.slice(0,7));
+  pintaEditor(dk, IDS_DIA);
+  pintaCobertura(dk);
+  pintaRepe(dk);
+  abrir("shDia");
+}
+
+/* ═══════════════ pantalla NÓMINA ═══════════════ */
+function fila(cont, k, cnt, v, cls){
+  var r = el("div","nrow"+(cls?" "+cls:"")+((!v||Math.abs(v)<0.005)&&cls!=="tot"?" z":""));
+  r.appendChild(el("div","k",k));
+  if(cnt) r.appendChild(el("div","c",cnt));
+  r.appendChild(el("div","v", eur(v)));
+  cont.appendChild(r);
+}
+function renderNom(){
+  var P = calcPago(mesActivo), B = P.B, R = P.R, s = P.src;
+  $("nomTitulo").textContent = nomMes(mesActivo);
+  document.querySelectorAll("[data-modo]").forEach(function(b){ b.dataset.on = (b.dataset.modo===DB.modo)?"1":"0"; });
+
+  var venc = DB.modo==="VENCIDO";
+  $("nomModoNota").innerHTML = venc
+    ? "Los pluses y las horas de más se cobran <b>el mes siguiente</b>. Lo que ves aquí es el dinero que entra en <b>"+nomMes(mesActivo)+"</b>: el sueldo base de este mes más los pluses que generó <b>"+nomMes(P.srcMk)+"</b>."
+    : "Todo se cuenta dentro de <b>"+nomMes(mesActivo)+"</b>: las horas de este mes y sus pluses juntos. Sirve para ver <b>lo que estás generando</b> ahora mismo.";
+
+  $("nomTotal").textContent = eur(P.aCobrar);
+  $("nomTotalSub").textContent = venc ? ("ingreso de "+nomMes(mesActivo)) : ("generado en "+nomMes(mesActivo));
+  $("nomAdicDe").textContent = venc ? ("· de "+nomMes(P.srcMk)) : "";
+
+  var cb = $("nomBase"); cb.innerHTML = "";
+  fila(cb, "Valor base", "fijo", B.base, "first");
+  fila(cb, "Horas complementarias", num(P.compl)+" h × "+num(B.valorCompl)+" €", P.complEur);
+  fila(cb, "Total base", "", P.totalBase, "tot");
+  if(P.compl > 0){
+    var nb = el("div","note");
+    nb.innerHTML = "Te pagan <b>"+num(P.compl)+" h</b> de más porque el mes pasó de las <b>"
+      + B.umbral + " h</b> que lleva tu contrato. Ese número está en Ajustes: "
+      + "<b>compruébalo en tu contrato</b>, porque con tu cuadrante te pasas casi todos los meses "
+      + "y si está mal, falla siempre por lo mismo.";
+    cb.appendChild(nb);
+  }
+
+  var ca = $("nomAdic"); ca.innerHTML = "";
+  fila(ca, "Nocturnidad",  num(s.noc)+" h × "+num(R.noc)+" €",        P.ad.noc, "first");
+  fila(ca, "Madrugue",     s.mad+" × "+num(R.mad)+" €",               P.ad.mad);
+  fila(ca, "Festivo",      s.fes+" × "+num(R.fes)+" € × "+(B.fesHoras||6)+" h", P.ad.fes);
+  fila(ca, "Domingos",     s.dom+" × "+num(R.dom)+" €",               P.ad.dom);
+  fila(ca, "Fraccionada",  s.frac+" × "+num(R.frac)+" €",             P.ad.frac);
+  fila(ca, "Transporte",   s.transp+" × "+num(R.transp)+" €",         P.ad.transp);
+  fila(ca, "Manutención",  s.manut+" × "+num(R.manut)+" €",           P.ad.manut);
+  fila(ca, "TFD",          "fijo",                                     P.ad.tfd);
+  fila(ca, "Perentorias",  num(s.per)+" × "+num(R.per)+" €",          P.ad.per);
+  fila(ca, "Total adicionales", "", P.totalAd, "tot");
+  if(venc && s.vacio){
+    var w = el("div","note warn");
+    w.innerHTML = "No hay horas apuntadas en <b>"+nomMes(P.srcMk)+"</b>, así que los pluses salen a cero. Apunta ese mes en el calendario y este número se rellena solo.";
+    ca.appendChild(w);
+  }
+
+  var cf = $("nomFinal"); cf.innerHTML = "";
+  fila(cf, "Base", "", P.totalBase, "first");
+  fila(cf, "Adicionales", "", P.totalAd);
+  if(P.porc){
+    fila(cf, "Bruto", "", P.bruto, "tot");
+    fila(cf, "Seguridad Social", num(B.impSS)+" %",   -P.ss,   "neg");
+    fila(cf, "IRPF",             num(B.impIRPF)+" %", -P.irpf, "neg");
+  } else {
+    fila(cf, "Impuestos", "fijo · " + num(P.bruto ? P.impuestos/P.bruto*100 : 0,1) + " % del bruto", -P.impuestos, "neg");
+  }
+  fila(cf, "A cobrar", "", P.aCobrar, "tot");
+
+  var M = DB.meses[mesActivo];
+  $("nomReal").value = (M && M.real != null) ? num(M.real) : "";
+  var cd = $("nomDesvio"); cd.innerHTML = "";
+  if(M && M.real != null && isFinite(M.real)){
+    var dif = M.real - P.aCobrar, ok = Math.abs(dif) < 1;
+    var n = el("div","note" + (ok ? "" : " warn"));
+    n.innerHTML = ok
+      ? "Clavado. La estimación se puede creer."
+      : "La app calculó <b>"+eur(P.aCobrar)+"</b> y cobraste <b>"+eur(M.real)+"</b>: "
+        + (dif>0 ? "<b>"+eur(dif)+" de más</b>." : "<b>"+eur(-dif)+" de menos</b>.")
+        + " Si se repite varios meses, ajusta impuestos o los valores en Ajustes.";
+    cd.appendChild(n);
+  }
+  renderHist();
+}
+/* Todos los meses con horas, del mas nuevo al mas viejo. Para no tener que
+   darle 20 veces a "mes anterior" cuando lleve anos usandola. */
+function renderHist(){
+  var c = $("histBody"); c.innerHTML = "";
+  var ks = Object.keys(DB.meses).filter(function(k){ return !calcMes(k).vacio; }).sort().reverse();
+  if(!ks.length){ c.appendChild(el("div","note","Aquí irán apareciendo los meses según los vayas apuntando.")); return; }
+  ks.forEach(function(k,i){
+    var t = calcMes(k), P = calcPago(k);
+    var r = el("button","nrow"+(i===0?" first":""));
+    r.style.cssText = "width:100%;text-align:left;"+(k===mesActivo?"background:#F4EDE6;border-radius:12px;padding-left:8px;padding-right:8px":"");
+    var kk = el("div","k");
+    kk.innerHTML = '<span style="text-transform:capitalize">'+nomMes(k)+'</span>'
+                 + '<small style="display:block;font-size:11px;color:var(--muted);font-weight:500">'+horas(t.horas)+' · '+t.dias+(t.dias===1?' día':' días')+'</small>';
+    r.appendChild(kk);
+    var M = DB.meses[k];
+    var v = el("div","v", eur(M && M.real != null ? M.real : P.aCobrar));
+    if(M && M.real != null) v.style.color = "var(--menthe-d)";
+    r.appendChild(v);
+    r.onclick = function(){ mesActivo = k; window.scrollTo(0,0); render(); };
+    c.appendChild(r);
+  });
+}
+function resumenTexto(){
+  var P = calcPago(mesActivo), s = P.src, m = calcMes(mesActivo);
+  var L = [];
+  L.push("FICHAJE · "+nomMes(mesActivo).toUpperCase());
+  L.push(DB.modo==="VENCIDO" ? "(base de "+nomMes(mesActivo)+" + pluses de "+nomMes(P.srcMk)+")" : "(todo del mes en curso)");
+  L.push("");
+  L.push("Horas del mes: "+horas(m.horas)+"  ·  Días: "+m.dias);
+  if(m.compl>0) L.push("Complementarias: "+horas(m.compl));
+  L.push("");
+  L.push("BASE");
+  L.push("  Valor base ............ "+eur(P.B.base));
+  L.push("  Complementarias ....... "+eur(P.complEur)+"  ("+num(P.compl)+" h)");
+  L.push("  Total base ............ "+eur(P.totalBase));
+  L.push("");
+  L.push("ADICIONALES");
+  L.push("  Nocturnidad ........... "+eur(P.ad.noc)+"  ("+num(s.noc)+" h)");
+  L.push("  Madrugue .............. "+eur(P.ad.mad)+"  ("+s.mad+")");
+  L.push("  Festivo ............... "+eur(P.ad.fes)+"  ("+s.fes+")");
+  L.push("  Domingos .............. "+eur(P.ad.dom)+"  ("+s.dom+")");
+  L.push("  Fraccionada ........... "+eur(P.ad.frac)+"  ("+s.frac+")");
+  L.push("  Transporte ............ "+eur(P.ad.transp)+"  ("+s.transp+")");
+  L.push("  Manutención ........... "+eur(P.ad.manut)+"  ("+s.manut+")");
+  L.push("  TFD ................... "+eur(P.ad.tfd));
+  L.push("  Perentorias ........... "+eur(P.ad.per)+"  ("+num(s.per)+")");
+  L.push("  Total adicionales ..... "+eur(P.totalAd));
+  L.push("");
+  L.push("  Impuestos ............. -"+eur(P.impuestos));
+  L.push("  A COBRAR .............. "+eur(P.aCobrar));
+  return L.join("\n");
+}
+
+/* ═══════════════ pantalla AJUSTES ═══════════════ */
+/* Nada de type="number": en un iPhone en español el teclado da coma decimal y
+   el input la tira, asi que "10,25" se perderia. Texto + inputmode. */
+/* Traga lo que sea que escriba: 1480,25 · 1.480,25 · 1480.25 · 1.480 · 10,25 €.
+   Regla: si lo ultimo tras un punto o una coma son 1 o 2 cifras, eso es la parte
+   decimal y el resto de separadores son miles. Si no, todo eran miles.        */
+function aNum(s){
+  s = String(s).trim().replace(/[\s €]/g, "");
+  if(!s) return null;
+  var neg = s.charAt(0) === "-"; if(neg) s = s.slice(1);
+  if(!/^[\d.,]+$/.test(s)) return null;
+  var m = s.match(/[.,](\d+)$/);
+  if(m && m[1].length <= 2){
+    var corte = s.length - m[0].length;
+    s = s.slice(0, corte).replace(/[.,]/g, "") + "." + m[1];
+  } else {
+    s = s.replace(/[.,]/g, "");
+  }
+  var v = parseFloat(s);
+  return isNaN(v) ? null : (neg ? -v : v);
+}
+function campo(cont, k, sub, val, onset){
+  var r = el("div","rowline");
+  var kk = el("div","k");
+  kk.innerHTML = k + (sub ? "<small>"+sub+"</small>" : "");
+  var inp = document.createElement("input");
+  inp.className = "fin"; inp.type = "text"; inp.inputMode = "decimal";
+  inp.value = num(val);
+  inp.onchange = function(){
+    var v = aNum(inp.value);
+    if(v === null){ inp.value = num(val); toast("Eso no es un número"); return; }
+    onset(v); guardar(); render();
+  };
+  r.appendChild(kk); r.appendChild(inp); cont.appendChild(r);
+}
+function renderSet(){
+  $("setNombre").value = DB.nombre;
+
+  var M = mesW(mesActivo), B = M.cfg.base, R = M.cfg.rates;
+  var cb = $("setBase"); cb.innerHTML = "";
+  var hd = el("div","lbl","Valores de "+nomMes(mesActivo)); hd.style.marginBottom="2px"; cb.appendChild(hd);
+  campo(cb, "Sueldo base", "€ fijos al mes", B.base, function(v){ B.base=v; });
+  campo(cb, "Horas incluidas", "a partir de aquí son complementarias", B.umbral, function(v){ B.umbral=v; });
+  campo(cb, "Valor hora complementaria", "€ por hora de más", B.valorCompl, function(v){ B.valorCompl=v; });
+  campo(cb, "Horas por festivo", "el plus se paga × estas horas", B.fesHoras||6, function(v){ B.fesHoras=v; });
+  var rI = el("div","rowline");
+  var kI = el("div","k");
+  kI.innerHTML = "Impuestos en porcentaje<small>lo suyo: la Seguridad Social y el IRPF son un % del bruto, no un fijo</small>";
+  var sI = el("div","sw"); sI.dataset.on = B.impModo==="PORC" ? "1" : "0";
+  sI.onclick = function(){ B.impModo = B.impModo==="PORC" ? "FIJO" : "PORC"; guardar(); render(); };
+  rI.appendChild(kI); rI.appendChild(sI); cb.appendChild(rI);
+  if(B.impModo === "PORC"){
+    campo(cb, "Seguridad Social", "% del bruto", B.impSS,   function(v){ B.impSS=v; });
+    campo(cb, "IRPF", "% del bruto · míralo en tu nómina", B.impIRPF, function(v){ B.impIRPF=v; });
+  } else {
+    campo(cb, "Impuestos", "€ que se restan al final", B.impuestos, function(v){ B.impuestos=v; });
+  }
+  var eq = calcPago(mesActivo);
+  var nI = el("div","note");
+  nI.innerHTML = B.impModo==="PORC"
+    ? "Con lo puesto, este mes se van <b>"+eur(eq.impuestos)+"</b> de un bruto de "+eur(eq.bruto)+"."
+    : "Los "+eur(B.impuestos)+" fijos son un <b>"+num(eq.bruto?B.impuestos/eq.bruto*100:0,1)+" %</b> del bruto de este mes. "
+      + "Si cambias de mes ese porcentaje se mueve, y por eso el fijo falla en los meses cargados. "
+      + "Los porcentajes de verdad los tienes en tu nómina.";
+  cb.appendChild(nI);
+  var rV = el("div","rowline");
+  var kV = el("div","k");
+  kV.innerHTML = "Festivos de la Comunitat Valenciana<small>San José, 9 d’Octubre, Lunes de Pascua y Sant Vicent Ferrer</small>";
+  var sV = el("div","sw"); sV.dataset.on = B.festCV !== 0 ? "1" : "0";
+  sV.onclick = function(){ B.festCV = B.festCV !== 0 ? 0 : 1; cacheFest = {}; guardar(); render(); };
+  rV.appendChild(kV); rV.appendChild(sV); cb.appendChild(rV);
+  var nV = el("div","note");
+  nV.innerHTML = "Los <b>nacionales y los de la Comunitat</b> se marcan solos. Los <b>dos locales de tu pueblo</b> "
+    + "cambian cada año, así que ésos los marcas tú tocando el día en el calendario.";
+  cb.appendChild(nV);
+
+  var rm = el("div","rowline");
+  var km = el("div","k"); km.innerHTML = "El madrugue sustituye a la nocturnidad<small>si entras de 04:00 a 06:55 cobras el madrugue, no la nocturnidad de esas horas</small>";
+  var sm = el("div","sw"); sm.dataset.on = B.madNoc ? "1" : "0";
+  sm.onclick = function(){ B.madNoc = B.madNoc ? 0 : 1; guardar(); render(); };
+  rm.appendChild(km); rm.appendChild(sm); cb.appendChild(rm);
+
+  var cr = $("setRates"); cr.innerHTML = "";
+  var hd2 = el("div","lbl","Valores de "+nomMes(mesActivo)); hd2.style.marginBottom="2px"; cr.appendChild(hd2);
+  campo(cr, "Nocturnidad", "€/hora entre 22:00 y 06:00", R.noc, function(v){ R.noc=v; });
+  campo(cr, "Madrugue", "€/día, entrada de 04:00 a 06:55", R.mad, function(v){ R.mad=v; });
+  campo(cr, "Festivo", "€/hora adicional en festivo", R.fes, function(v){ R.fes=v; });
+  campo(cr, "Domingos", "€ por domingo trabajado", R.dom, function(v){ R.dom=v; });
+  campo(cr, "Fraccionada", "€ por día de turno partido", R.frac, function(v){ R.frac=v; });
+  campo(cr, "Transporte", "€ por día de asistencia", R.transp, function(v){ R.transp=v; });
+  campo(cr, "Manutención", "€ por día de más de 6 h", R.manut, function(v){ R.manut=v; });
+  campo(cr, "TFD", "€ fijos al mes", R.tfd, function(v){ R.tfd=v; });
+  campo(cr, "Perentorias", "€ por perentoria", R.per, function(v){ R.per=v; });
+
+  var nm = Object.keys(DB.meses).length, nd = 0;
+  Object.keys(DB.meses).forEach(function(k){ nd += Object.keys(DB.meses[k].dias||{}).length; });
+  var C = DB.cuadrante;
+  $("setCuEstado").textContent = (C && C.auto)
+    ? "puesto: ciclo de 3 semanas, rellena los días vacíos"
+    : "apagado, lo pones tú a mano";
+
+  var av = $("setAvisoCopia"), hayDatos = false;
+  Object.keys(DB.meses).forEach(function(k){ if(!calcMes(k).vacio) hayDatos = true; });
+  var dias = DB.ultimaCopia ? Math.floor((hoyDate() - new Date(DB.ultimaCopia))/86400000) : null;
+  av.classList.toggle("hide", !(hayDatos && (dias === null || dias >= 30)));
+  av.className = "note warn" + (av.classList.contains("hide") ? " hide" : "");
+  av.innerHTML = dias === null
+    ? "Todavía <b>no has hecho ninguna copia</b>. Si pierdes el móvil, pierdes las horas. Dale a «Copia de seguridad» y guárdala en Archivos."
+    : "Hace <b>"+dias+" días</b> de la última copia. Haz otra y guárdala en Archivos.";
+
+  var si = $("setInfo");
+  si.className = "note" + (fallaGuardar ? " warn" : "");
+  si.innerHTML = fallaGuardar
+    ? "<b>Ojo:</b> el móvil no está dejando guardar (memoria llena). Haz una copia de seguridad ahora y libera espacio, o lo último que apuntes se perderá al cerrar."
+    : "Guardado en este móvil: <b>"+nm+"</b> mes(es), <b>"+nd+"</b> día(s). La app funciona sin internet y no manda nada a ningún sitio.";
+}
+
+/* La foto incrustada es de una persona concreta (FOTO_DE): solo sale si quien
+   usa la app es esa. Cualquier otra ve su inicial hasta que ponga la suya. */
+function fotoActual(){
+  if(DB.foto) return DB.foto;
+  var duena = (FOTO_DE||"").trim().toLowerCase();
+  var suya = DB.quienSoy && duena && (DB.nombre||"").trim().toLowerCase() === duena;
+  return (suya && FOTO_DEF.indexOf("data:") === 0) ? FOTO_DEF : "";
+}
+/* Tapa la app entera hasta que diga quién es. Otra persona abrió la app
+   compartida y le salía el nombre de otra persona como si fuera suya. */
+function renderOnboard(){
+  var ob = $("onboard"), toca = !DB.quienSoy;
+  ob.classList.toggle("on", toca);
+  if(!toca) return;
+  var inp = $("obNombre"), btn = $("obEmpezar");
+  if(document.activeElement !== inp) inp.value = DB.nombre || "";
+
+  function escribe(){
+    DB.nombre = inp.value.trim();           /* se guarda ya, para no perderlo al poner la foto */
+    btn.disabled = !DB.nombre;
+    guardar(); renderOnboard();
+  }
+  inp.oninput = escribe;
+  inp.onkeydown = function(e){ if(e.key === "Enter"){ e.preventDefault(); empezar(); } };
+  btn.disabled = !inp.value.trim();
+  $("obFoto").onclick = function(){ $("filePhoto").click(); };
+  btn.onclick = empezar;
+  function empezar(){
+    var n = inp.value.trim();
+    if(!n){ inp.focus(); toast("Escribe tu nombre para entrar"); return; }
+    DB.nombre = n; DB.quienSoy = 1; guardar(); render();
+    toast("¡Hola, " + n + "! 👋");
+  }
+}
+function pintaAvatar(){
+  var f = fotoActual();
+  $("avatar").innerHTML = f ? '<img src="'+f+'" alt="">'
+                            : '<span class="ini">'+((DB.nombre||"?").charAt(0).toUpperCase())+'</span>';
+}
+
+/* ═══════════════ render maestro ═══════════════ */
+function render(){
+  ["Hoy","Mes","Nom","Set"].forEach(function(s){ $("sc"+s).classList.toggle("on", s===vista); });
+  document.querySelectorAll(".nav button").forEach(function(b){ b.dataset.on = (b.dataset.sc===vista)?"1":"0"; });
+  pintaAvatar();
+  $("nombre").textContent = DB.nombre;
+  renderOnboard();
+  if(vista==="Hoy") renderHoy();
+  if(vista==="Mes") renderMes();
+  if(vista==="Nom") renderNom();
+  if(vista==="Set") renderSet();
+}
+
+/* ═══════════════ turnos cubiertos ═══════════════
+   En su Excel había desplegables de "me cubre" / "cubro a". Aquí es lo mismo
+   pero sin nombres fijos: ella escribe a quién. ME = alguien le cubre el turno
+   (no trabaja); YO = va ella a cubrir a otra persona.                      */
+var CUB = [
+  {k:"",   n:"Nada",     ic:"—"},
+  {k:"ME", n:"Me cubren", ic:"🤝"},
+  {k:"YO", n:"Cubro yo",  ic:"💪"}
+];
+function pintaCobertura(dk){
+  var d = diaR(dk) || {}, c = d.cub || {};
+  var cT = $("dCubTipo"); cT.innerHTML = "";
+  CUB.forEach(function(t){
+    var b = el("button","turno");
+    b.dataset.t = t.k === "ME" ? "NOCHES" : (t.k === "YO" ? "MANANA" : "LIBRE");
+    b.dataset.on = ((c.tipo||"") === t.k) ? "1" : "0";
+    b.innerHTML = '<span class="ic">'+t.ic+'</span>'+t.n;
+    b.onclick = function(){
+      var w = mio(dk);
+      if(!t.k){ delete w.cub; }
+      else {
+        w.cub = { tipo:t.k, quien:(w.cub && w.cub.quien) || "" };
+        /* si le cubren el turno, ese día no trabaja ella */
+        if(t.k === "ME"){ w.t = []; w.turno = "LIBRE"; }
+      }
+      guardar(); pintaEditor(dk, IDS_DIA); pintaCobertura(dk); render();
+    };
+    cT.appendChild(b);
+  });
+  var cQ = $("dCubQuien"); cQ.innerHTML = "";
+  if(!c.tipo) return;
+  var r = el("div","rowline"); r.style.borderTop = "0";
+  r.appendChild(el("div","k", c.tipo === "ME" ? "Me cubre" : "Cubro a"));
+  var inp = document.createElement("input");
+  inp.className = "fin"; inp.type = "text"; inp.style.textAlign = "right";
+  inp.style.width = "150px"; inp.placeholder = "¿quién?"; inp.maxLength = 20;
+  inp.value = c.quien || "";
+  inp.onchange = function(){
+    var w = mio(dk);
+    if(w.cub) w.cub.quien = inp.value.trim();
+    guardar(); render();
+  };
+  r.appendChild(inp); cQ.appendChild(r);
+}
+/* Balance de toda la vida: positivo = le deben turnos */
+function balanceCub(){
+  var me = 0, yo = 0, gente = {};
+  Object.keys(DB.meses).forEach(function(mk){
+    var ds = DB.meses[mk].dias || {};
+    Object.keys(ds).forEach(function(dk){
+      var c = ds[dk].cub; if(!c || !c.tipo) return;
+      var q = (c.quien || "").trim() || "sin nombre";
+      if(!gente[q]) gente[q] = {me:0, yo:0};
+      if(c.tipo === "ME"){ me++; gente[q].me++; } else { yo++; gente[q].yo++; }
+    });
+  });
+  return {me:me, yo:yo, saldo:me-yo, gente:gente};
+}
+function renderCubierto(){
+  var B = balanceCub(), card = $("cubCard");
+  card.classList.toggle("hide", B.me + B.yo === 0);
+  if(B.me + B.yo === 0) return;
+  var c = $("cubResumen"); c.innerHTML = "";
+  Object.keys(B.gente).sort().forEach(function(q, i){
+    var g = B.gente[q], saldo = g.me - g.yo;
+    var r = el("div","nrow"+(i===0?" first":""));
+    var k = el("div","k");
+    k.innerHTML = '<span style="text-transform:capitalize">'+q+'</span>'
+      + '<small style="display:block;font-size:11px;color:var(--muted);font-weight:500">'
+      + 'te cubrió '+g.me+' · cubriste '+g.yo+'</small>';
+    r.appendChild(k);
+    var v = el("div","v", saldo === 0 ? "en paz" : (saldo > 0 ? "le debes "+saldo : "te deben "+(-saldo)));
+    v.style.color = saldo === 0 ? "var(--menthe-d)" : (saldo > 0 ? "var(--nect-d)" : "var(--lagune-d)");
+    v.style.fontSize = "13px";
+    r.appendChild(v); c.appendChild(r);
+  });
+  var t = el("div","nrow tot");
+  t.appendChild(el("div","k","En total"));
+  t.appendChild(el("div","v", B.saldo === 0 ? "en paz"
+    : (B.saldo > 0 ? "debes "+B.saldo+" turno"+(B.saldo>1?"s":"")
+                   : "te deben "+(-B.saldo)+" turno"+(-B.saldo>1?"s":""))));
+  c.appendChild(t);
+}
+
+/* ═══════════════ hoja del cuadrante ═══════════════ */
+var cuSel = null;                       /* semana elegida mientras está abierta la hoja */
+function renderCuadrante(){
+  var C = DB.cuadrante || {};
+  if(cuSel === null && C.ancla && C.auto){
+    var n = diasEntre(lunesDe(hoyDate()), parseDk(C.ancla));
+    cuSel = ((n % 21) + 21) % 21;       /* en qué semana del ciclo cae esta */
+  }
+  var cont = $("cuOpciones"); cont.innerHTML = "";
+  SEMANAS.forEach(function(sem){
+    var b = document.createElement("button");
+    b.dataset.on = (cuSel === sem.i) ? "1" : "0";
+    var tira = "";
+    ["L","M","X","J","V","S","D"].forEach(function(dl, k){
+      var t = CICLO[sem.i + k];
+      tira += '<i class="'+(t==="TARDE"?"T":t==="MANANA"?"M":"L")+'">'+dl+'</i>';
+    });
+    b.innerHTML = '<div class="tit">'+sem.t+'</div><div class="tira">'+tira+'</div>';
+    b.onclick = function(){ cuSel = sem.i; renderCuadrante(); };
+    cont.appendChild(b);
+  });
+  $("cuNota").innerHTML = cuSel === null
+    ? "Elige la de <b>esta semana</b> y la app coloca sola todas las demás, hacia delante y hacia atrás."
+    : "Hecho. Con eso ya sabe el ciclo entero: <b>tardes 7 días, 3 de fiesta, mañanas 7 días, 4 de fiesta</b>, y vuelta a empezar.";
+  $("cuAplicar").disabled = (cuSel === null);
+  $("cuAplicar").style.opacity = cuSel === null ? ".45" : "";
+
+  var P = plantilla(), ch = $("cuHoras"); ch.innerHTML = "";
+  [["MANANA","Mañana","var(--peche)"],["TARDE","Tarde","var(--nectarine)"],["NOCHES","Noches","var(--lagune)"]]
+  .forEach(function(t){
+    var r = el("div","plant");
+    var k = el("div","k");
+    k.innerHTML = '<span class="pt" style="background:'+t[2]+'"></span>'+t[1];
+    r.appendChild(k);
+    function cambia(campo){ return function(v){ P[t[0]][campo] = v; guardar();
+      var n = reaplicaAuto(); if(n) toast("Actualizados " + n + " días del cuadrante"); render(); }; }
+    r.appendChild(campoHoraLibre(P[t[0]].i, cambia("i")));
+    r.appendChild(el("span","t","→"));
+    r.appendChild(campoHoraLibre(P[t[0]].o, cambia("o")));
+    ch.appendChild(r);
+  });
+}
+/* campo de hora suelto, sin día detrás */
+function campoHoraLibre(valor, alCambiar){
+  var inp = document.createElement("input");
+  inp.type = "text"; inp.inputMode = "numeric"; inp.maxLength = 5; inp.placeholder = "--:--";
+  inp.value = valor || "";
+  inp.onfocus = function(){ inp.select(); };
+  inp.oninput = function(){ inp.value = vistaHora(soloDigitos(inp.value)); };
+  inp.onblur = function(){
+    var v = hhmm(inp.value);
+    if(v === null){ inp.value = valor || ""; toast("Esa hora no existe"); return; }
+    inp.value = v; alCambiar(v);
+  };
+  return inp;
+}
+
+/* ═══════════════ pop-ups explicativos ═══════════════ */
+var INFOS = {
+  modo: {
+    t: "¿Cuándo se cobra cada cosa?",
+    c: '<div class="card"><div class="lbl" style="margin-bottom:6px">🏦 A mes vencido</div>'
+      +'<p style="margin:0;font-size:14px">El sueldo base es del mes en curso, pero <b>los pluses y las horas de más se pagan el mes siguiente</b>. '
+      +'Así que en la nómina de junio entran el base de junio y los pluses que generaste en mayo.</p>'
+      +'<p style="margin:10px 0 0;font-size:13px;color:var(--muted)">Es como está montado el Excel y, si no ha cambiado el convenio, es lo que de verdad te llega al banco. <b>Déjalo así</b> si quieres saber cuánto vas a ingresar.</p></div>'
+      +'<div class="card"><div class="lbl" style="margin-bottom:6px">📅 Mes natural</div>'
+      +'<p style="margin:0;font-size:14px">Cuenta <b>todo dentro del mismo mes</b>: las horas de junio y los pluses que generan esas horas, juntos.</p>'
+      +'<p style="margin:10px 0 0;font-size:13px;color:var(--muted)">No es lo que cobras ese mes, pero sí <b>lo que vale el trabajo que estás haciendo ahora</b>. Va bien para ver al momento si te compensa coger un turno.</p></div>'
+      +'<div class="note">Cambiar el modo <b>no toca tus horas</b>. Solo cambia la forma de enseñar el total. Puedes ir y volver cuando quieras.</div>'
+  },
+  real: {
+    t: "¿Para qué sirve esto?",
+    c: '<div class="card"><p style="margin:0;font-size:14px">Cuando te llegue la nómina, apunta aquí <b>lo que te entró de verdad</b>. '
+      +'La app te dirá en cuánto se equivocó.</p>'
+      +'<p style="margin:10px 0 0;font-size:13px;color:var(--muted)">Si un mes falla, puede ser cosa de ese mes. '
+      +'Si falla <b>lo mismo varios meses seguidos</b>, es que hay un valor mal puesto: casi siempre los impuestos, '
+      +'que por defecto son un fijo de 150 € copiado de tu Excel y en realidad son un porcentaje.</p></div>'
+      +'<div class="note">El número que apuntes manda en la lista de «Todos tus meses»: ahí verás en verde los meses ya confirmados.</div>'
+  },
+  auto: {
+    t: "Lo que se calcula solo",
+    c: '<div class="card"><p style="margin:0 0 12px;font-size:14px">Tú solo pones la <b>hora de entrada y de salida</b>. Lo demás sale solo:</p>'
+      +'<div class="chips"><span class="chip noc">🌙 Nocturnidad</span><span class="chip mad">🌅 Madrugue</span><span class="chip par">◑ Partido</span>'
+      +'<span class="chip dom">☀ Domingo</span><span class="chip man">🍽 Manutención</span></div></div>'
+      +'<div class="card" style="font-size:13.5px">'
+      +'<div class="rowline" style="border-top:0"><div class="k">Nocturnidad<small>las horas que caen entre las 22:00 y las 06:00</small></div></div>'
+      +'<div class="rowline"><div class="k">Madrugue<small>si entras entre las 04:00 y las 06:55</small></div></div>'
+      +'<div class="rowline"><div class="k">Turno partido<small>si el día tiene dos tramos o más</small></div></div>'
+      +'<div class="rowline"><div class="k">Domingo<small>si trabajas en domingo</small></div></div>'
+      +'<div class="rowline"><div class="k">Manutención<small>si el día pasa de 6 horas</small></div></div>'
+      +'<div class="rowline"><div class="k">Transporte<small>por cada día que vas a trabajar</small></div></div>'
+      +'</div>'
+      +'<div class="note">A mano solo quedan <b>festivo</b> y <b>perentorias</b>, porque eso no se puede adivinar de la hora.</div>'
+  }
+};
+function info(k){
+  $("iTitulo").textContent = INFOS[k].t;
+  $("iCuerpo").innerHTML = INFOS[k].c;
+  abrir("shInfo");
+}
+
+/* ═══════════════ foto ═══════════════ */
+function ponerFoto(file){
+  var fr = new FileReader();
+  fr.onload = function(){
+    var img = new Image();
+    img.onload = function(){
+      var S = 320, cv = document.createElement("canvas");
+      cv.width = cv.height = S;
+      var ctx = cv.getContext("2d");
+      var lado = Math.min(img.width, img.height);
+      ctx.drawImage(img, (img.width-lado)/2, (img.height-lado)/2, lado, lado, 0, 0, S, S);
+      DB.foto = cv.toDataURL("image/jpeg", 0.82);
+      guardar(); render(); toast("Foto guardada");
+    };
+    img.onerror = function(){ toast("No se pudo leer la imagen"); };
+    img.src = fr.result;
+  };
+  fr.readAsDataURL(file);
+}
+
+/* ═══════════════ exportar ═══════════════ */
+/* En una PWA instalada en el iPhone el <a download> no hace nada, asi que
+   primero se intenta "Compartir" (que deja guardar en Archivos o iCloud). */
+async function guardarFuera(nombre, texto, mime, aviso){
+  var tipo = (mime||"text/plain")+";charset=utf-8";
+  try{
+    var f = new File([texto], nombre, {type:tipo});
+    if(navigator.canShare && navigator.canShare({files:[f]})){
+      await navigator.share({files:[f], title:nombre});
+      toast(aviso || "Guardado"); return true;
+    }
+  }catch(e){ if(e && e.name === "AbortError") return false; }
+  try{
+    var b = new Blob([texto], {type:tipo});
+    var u = URL.createObjectURL(b), a = document.createElement("a");
+    a.href = u; a.download = nombre; document.body.appendChild(a); a.click();
+    setTimeout(function(){ URL.revokeObjectURL(u); a.remove(); }, 800);
+  }catch(e2){}
+  return true;
+}
+function copiar(txt, ok){
+  if(navigator.clipboard && navigator.clipboard.writeText){
+    navigator.clipboard.writeText(txt).then(function(){ toast(ok); }, function(){ toast("No se pudo copiar"); });
+  } else {
+    var ta = document.createElement("textarea");
+    ta.value = txt; ta.style.cssText="position:fixed;opacity:0"; document.body.appendChild(ta);
+    ta.select(); try{ document.execCommand("copy"); toast(ok); }catch(e){ toast("No se pudo copiar"); }
+    ta.remove();
+  }
+}
+function csv(){
+  var L = ["fecha;dia;turno;entrada;salida;horas;nocturnidad;madrugue;partido;domingo;festivo;manutencion;perentorias"];
+  Object.keys(DB.meses).sort().forEach(function(mk){
+    var ds = DB.meses[mk].dias||{};
+    Object.keys(ds).sort().forEach(function(dk){
+      var d = ds[dk], c = calcDia(dk,d), t = d.t||[];
+      L.push([dk, DIAS[parseDk(dk).getDay()], d.turno||"",
+        t.length?t[0].i:"", t.length?t[t.length-1].o:"",
+        num(c.horas), num(c.noc), c.mad, c.frac, c.dom, c.fes?1:0, c.manut, num(c.per)].join(";"));
+    });
+  });
+  return "﻿"+L.join("\r\n");
+}
+
+/* ═══════════════ eventos ═══════════════ */
+function bind(){
+  document.querySelectorAll(".nav button").forEach(function(b){
+    b.onclick = function(){
+      if(!DB.quienSoy) return;                 /* con el cartel de "¿quién eres?" no se navega */
+      vista = b.dataset.sc; window.scrollTo(0,0); render();
+    };
+  });
+  $("ov").onclick = cerrarTodo;
+  document.querySelectorAll("[data-close]").forEach(function(b){
+    b.onclick = function(){ cerrar(b.dataset.close); render(); };
+  });
+  $("hoyAdd").onclick = function(){ addTramo(dkey(hoyDate()), IDS_HOY); };
+  $("dAdd").onclick   = function(){ if(diaAbierto) addTramo(diaAbierto, IDS_DIA); };
+  $("dBorrar").onclick = function(){
+    if(!diaAbierto) return;
+    var M = DB.meses[diaAbierto.slice(0,7)];
+    if(M && M.dias) delete M.dias[diaAbierto];
+    guardar(); cerrar("shDia"); render(); toast("Día vaciado");
+  };
+  $("mPrev").onclick = function(){ mesActivo = prevMk(mesActivo); render(); };
+  $("mNext").onclick = function(){ mesActivo = nextMk(mesActivo); render(); };
+  $("nomPrev").onclick = function(){ mesActivo = prevMk(mesActivo); render(); };
+  $("nomNext").onclick = function(){ mesActivo = nextMk(mesActivo); render(); };
+  $("nomInfo").onclick = function(){ info("modo"); };
+  document.querySelectorAll("[data-modo]").forEach(function(b){
+    b.onclick = function(){ DB.modo = b.dataset.modo; guardar(); render(); };
+  });
+  $("nomReal").onchange = function(){
+    var M = mesW(mesActivo), v = aNum(this.value);
+    if(String(this.value).trim() === "" || v === null) delete M.real; else M.real = v;
+    guardar(); render();
+  };
+  $("realInfo").onclick = function(){ info("real"); };
+  $("repeAplica").onclick = function(){ if(diaAbierto) repetir(diaAbierto); };
+  function abreCuadrante(){ cuSel = null; renderCuadrante(); abrir("shCuadrante"); }
+  $("mCuadrante").onclick   = abreCuadrante;
+  $("setCuadrante").onclick = abreCuadrante;
+  $("cuAplicar").onclick = function(){
+    if(cuSel === null) return;
+    /* ancla = el lunes en el que el ciclo estaría en su día 0 */
+    var lun = lunesDe(hoyDate()); lun.setDate(lun.getDate() - cuSel);
+    DB.cuadrante = { ancla: dkey(lun), auto: 1 };
+    guardar();
+    var h = hoyDate();
+    var n = aplicaCuadrante(lunesDe(new Date(h.getFullYear(), h.getMonth(), 1)),
+                            new Date(h.getFullYear(), h.getMonth()+3, 0));
+    cerrar("shCuadrante"); render();
+    toast(n ? ("Organizados " + n + " días") : "No había ningún día vacío que rellenar");
+  };
+  $("cuManual").onclick = function(){
+    var tenia = DB.cuadrante && DB.cuadrante.auto;
+    var puestos = 0;
+    Object.keys(DB.meses).forEach(function(mk){
+      var ds = DB.meses[mk].dias || {};
+      Object.keys(ds).forEach(function(dk){ if(ds[dk].auto) puestos++; });
+    });
+    if(puestos && !confirm("Hay " + puestos + " día(s) puestos por el cuadrante.\n\n"
+        + "¿Los quito también? Lo que hayas apuntado tú se queda igual.")){
+      DB.cuadrante = null; guardar(); cerrar("shCuadrante"); render();
+      toast("Cuadrante apagado"); return;
+    }
+    var n = borraAuto();
+    DB.cuadrante = null; guardar(); cerrar("shCuadrante"); render();
+    toast(tenia ? ("Cuadrante apagado" + (n ? ", " + n + " días quitados" : "")) : "Lo pones tú a mano");
+  };
+  $("nomCopiar").onclick = function(){ copiar(resumenTexto(), "Resumen copiado"); };
+  $("avatar").onclick = function(){ $("filePhoto").click(); };
+  $("setFoto").onclick = function(){ $("filePhoto").click(); };
+  $("setFotoQuita").onclick = function(){
+    if(!DB.foto){ toast("No tienes ninguna puesta"); return; }
+    delete DB.foto; guardar(); render(); toast("Foto quitada");
+  };
+  $("filePhoto").onchange = function(){ if(this.files && this.files[0]) ponerFoto(this.files[0]); this.value=""; };
+  $("setNombre").onchange = function(){
+    var n = this.value.trim();
+    if(!n){ this.value = DB.nombre; toast("Algún nombre hay que poner"); return; }
+    DB.nombre = n; guardar(); render();
+  };
+  $("setAplicar").onclick = function(){
+    var c = clone(cfgDe(mesActivo));
+    Object.keys(DB.meses).forEach(function(k){ DB.meses[k].cfg = clone(c); });
+    DB.ajustes.rates = clone(c.rates); DB.ajustes.base = clone(c.base);
+    guardar(); render(); toast("Valores aplicados a todos los meses");
+  };
+  $("setExport").onclick = async function(){
+    var j = JSON.stringify(DB, null, 1);
+    var hecho = await guardarFuera("fichaje-"+dkey(hoyDate())+".json",
+                                   j, "application/json", "Copia guardada");
+    if(!hecho) return;                       /* le dio a cancelar en Compartir */
+    DB.ultimaCopia = dkey(hoyDate()); guardar(); render();
+  };
+  $("setImport").onclick = function(){ $("fileJson").click(); };
+  $("fileJson").onchange = function(){
+    var f = this.files && this.files[0]; this.value="";
+    if(!f) return;
+    var fr = new FileReader();
+    fr.onload = function(){
+      try{
+        var o = JSON.parse(fr.result);
+        if(!o || !o.meses) throw 0;
+        var n = 0;
+        Object.keys(o.meses).forEach(function(k){ n += Object.keys((o.meses[k]||{}).dias||{}).length; });
+        if(!confirm("La copia tiene "+n+" día(s) apuntados.\n\n"
+                    + "Se sustituye TODO lo que hay ahora. ¿Sigo?")) return;
+        DB = o; normaliza();                 /* normaliza, NO cargar: cargar releeria el movil */
+        mesActivo = mkVivo = mkey(hoyDate());
+        guardar(); render(); toast("Copia restaurada: "+n+" día(s)");
+      }catch(e){ toast("Ese archivo no vale"); }
+    };
+    fr.readAsText(f);
+  };
+  $("setCsv").onclick = function(){
+    guardarFuera("fichaje-"+dkey(hoyDate())+".csv", csv(), "text/csv", "CSV guardado");
+  };
+  $("setReset").onclick = function(){
+    if(!confirm("¿Seguro? Se borran todas las horas apuntadas.")) return;
+    if(!confirm("Esto no se puede deshacer. ¿Borrar de verdad?")) return;
+    try{ localStorage.removeItem(KEY); }catch(e){}
+    DB = null; cargar(); mesActivo = mkVivo = mkey(hoyDate()); render(); toast("Todo borrado");
+  };
+  $("hoyChips").onclick = function(){ info("auto"); };
+  $("dChips").onclick   = function(){ info("auto"); };
+}
+
+/* ═══════════════ cambio de dia y de mes ═══════════════
+   La app vive instalada en el movil y casi nunca se cierra del todo: hay que
+   darse cuenta de que ha cambiado el dia (o el mes) sin recargar la pagina.  */
+var dkVivo, mkVivo;
+function compruebaFecha(){
+  var d = hoyDate(), dkAhora = dkey(d), mkAhora = mkey(d);
+  if(dkAhora === dkVivo) return;
+  var cambiaMes = mkAhora !== mkVivo;
+  /* si estaba mirando el mes que acaba de terminar, la llevo al nuevo;
+     si se habia ido a mirar otro mes a proposito, la dejo donde estaba */
+  if(cambiaMes && mesActivo === mkVivo) mesActivo = mkAhora;
+  dkVivo = dkAhora; mkVivo = mkAhora;
+  if(cambiaMes) cuadranteAlDia();
+  render();
+  if(cambiaMes) toast("Empieza " + MESES[d.getMonth()] + ". El mes anterior queda guardado.");
+}
+
+/* ═══════════════ arranque ═══════════════ */
+cargar();
+cuadranteAlDia();
+mesActivo = mkVivo = mkey(hoyDate());
+dkVivo = dkey(hoyDate());
+bind();
+render();
+
+document.addEventListener("visibilitychange", function(){ if(!document.hidden) compruebaFecha(); });
+window.addEventListener("focus", compruebaFecha);
+window.addEventListener("pageshow", compruebaFecha);
+setInterval(compruebaFecha, 60000);
+
+if("serviceWorker" in navigator && location.protocol.indexOf("http")===0){
+  navigator.serviceWorker.register("sw.js").catch(function(){});
+}
+})();
+</script>
+</body>
+</html>
